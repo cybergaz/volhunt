@@ -1,0 +1,12 @@
+{
+  "name": "volhunt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "volhunt": "src/main.ts" },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "once": "bun src/main.ts --once"
+  },
+  "devDependencies": { "@types/bun": "latest" }
+}
