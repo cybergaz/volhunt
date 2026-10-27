@@ -13,11 +13,10 @@ export type Position = {
   entry: number;
   tp: number;
   sl: number;
+  liq: number; // liquidation price
   openedAt: number;
 };
 export type Closed = Position & { exit: number; pnl: number; roe: number; reason: string; closedAt: number };
-
-const LIQ_ROE = -90; // rough isolated-margin liquidation point, % of margin
 
 export class Paper {
   positions = new Map<string, Position>();
@@ -34,13 +33,14 @@ export class Paper {
     return this.log;
   }
 
-  open(pair: string, side: Side, last: number, spreadPct: number, atr: number, o: { lev: number; margin: number; tpAtr: number; slAtr: number }) {
+  open(pair: string, side: Side, last: number, spreadPct: number, atr: number, o: { lev: number; margin: number; tpAtr: number; slAtr: number; liqPct: number }) {
     const entry = last * (1 + (side * (spreadPct || 0)) / 200);
     const qty = (o.margin * o.lev) / entry;
     const p: Position = {
       pair, side, lev: o.lev, margin: o.margin, qty, entry,
       tp: entry + side * o.tpAtr * atr,
       sl: entry - side * o.slAtr * atr,
+      liq: entry * (1 - (side * o.liqPct) / 100),
       openedAt: Date.now(),
     };
     this.positions.set(pair, p);
@@ -64,7 +64,7 @@ export class Paper {
     const p = this.positions.get(pair);
     if (!p) return;
     let { exit, pnl, roe } = this.value(p, price, spreadPct);
-    if (roe <= LIQ_ROE) ({ pnl, roe } = { pnl: -p.margin, roe: -100 });
+    if (reason === "LIQ") ({ pnl, roe } = { pnl: -p.margin, roe: -100 }); // isolated: the whole margin is gone
     const c: Closed = { ...p, exit, pnl, roe, reason, closedAt: Date.now() };
     this.positions.delete(pair);
     this.closed.push(c);
@@ -79,8 +79,8 @@ export class Paper {
     const p = this.positions.get(pair);
     if (!p) return;
     if (p.side * (price - p.tp) >= 0) return this.close(pair, price, spreadPct, "TP");
+    if (p.side * (price - p.liq) <= 0) return this.close(pair, price, spreadPct, "LIQ");
     if (p.side * (price - p.sl) <= 0) return this.close(pair, price, spreadPct, "SL");
-    if (this.value(p, price, spreadPct).roe <= LIQ_ROE) return this.close(pair, price, spreadPct, "LIQ");
   }
 
   stats() {

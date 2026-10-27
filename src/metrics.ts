@@ -1,4 +1,4 @@
-import type { Book, Candle, Ticker } from "./api";
+import type { Book, Candle, Instrument, Ticker } from "./api";
 
 export type Metrics = {
   atrPct: number; // ATR(14) on 1m candles as % of price: "how much a typical candle moves"
@@ -21,6 +21,19 @@ export function atr(c: Candle[], n = 14): number {
 }
 
 const mean = (xs: number[]) => (xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : NaN);
+
+/** Highest leverage CoinDCX allows for `margin` USDT (bigger positions get lower caps). NaN if unknown. */
+export function maxLeverage(ins: Instrument, margin: number): number {
+  for (const [lev, cap] of ins.levTiers) if (margin * lev <= cap) return lev;
+  return ins.levTiers.at(-1)?.[0] ?? NaN;
+}
+
+/** Approximate adverse price move (%) that liquidates an isolated position: margin minus maintenance margin. */
+export function liqMovePct(ins: Instrument | undefined, lev: number, margin: number): number {
+  const notional = margin * lev;
+  const mm = ins?.mmTiers.find(([cap]) => notional <= cap)?.[1] ?? ins?.mmTiers.at(-1)?.[1] ?? 1.5;
+  return Math.max(0, 100 / lev - mm);
+}
 
 export function compute(t: Ticker, raw: Candle[], b: Book | undefined, feePct: number): Metrics | undefined {
   // Drop the in-progress candle so its partial volume doesn't skew the surge ratio.

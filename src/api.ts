@@ -32,6 +32,23 @@ export async function tickers(): Promise<Map<string, Ticker>> {
   return out;
 }
 
+export type Instrument = {
+  levTiers: [lev: number, maxNotional: number][]; // highest leverage first
+  mmTiers: [maxNotional: number, mmPct: number][]; // maintenance margin by position size, smallest first
+};
+
+/** Contract risk limits: max leverage per position size, maintenance margin per position size. */
+export async function instrument(pair: string): Promise<Instrument> {
+  const { instrument: i } = await get<{ instrument: any }>(
+    `${API}/exchange/v1/derivatives/futures/data/instrument?pair=${pair}&margin_currency_short_name=USDT`,
+  );
+  const tiers = (o: Record<string, number> | null) => Object.entries(o ?? {}).map(([k, v]) => [+k, +v] as [number, number]);
+  return {
+    levTiers: tiers(i.dynamic_position_leverage_details).sort((a, b) => b[0] - a[0]),
+    mmTiers: tiers(i.dynamic_safety_margin_details).sort((a, b) => a[0] - b[0]),
+  };
+}
+
 /** INR per USDT: the fixed rate CoinDCX applies to INR-margined futures, falling back to the spot price. */
 export async function inrRate(): Promise<number> {
   const conv = await get<{ symbol: string; conversion_price: number }[]>(`${API}/api/v1/derivatives/futures/data/conversions`).catch(() => []);

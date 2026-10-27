@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 // volhunt — CoinDCX futures volatility scanner + paper scalper (TUI).
 import { parseArgs } from "node:util";
-import { activePairs, book, candles1m, inrRate, pool, tickers, type Book, type Ticker } from "./api";
-import { compute, type Metrics } from "./metrics";
+import { activePairs, book, candles1m, inrRate, instrument, pool, tickers, type Book, type Instrument, type Ticker } from "./api";
+import { compute, liqMovePct, maxLeverage, type Metrics } from "./metrics";
 import { Paper, type Side } from "./paper";
 
-const SORTS = ["score", "atr", "5m", "surge", "range"] as const;
+// Same left-to-right order as the table columns, so tab / shift+tab step to the neighbouring column.
+const SORTS = ["range", "atr", "liq", "5m", "surge", "score", "scorev2"] as const;
 type Sort = (typeof SORTS)[number];
 
 const { values: argv } = parseArgs({
@@ -52,8 +53,11 @@ let active = new Set<string>();
 let ticks = new Map<string, Ticker>();
 const metrics = new Map<string, Metrics>();
 const books = new Map<string, Book>();
+const instruments = new Map<string, Instrument>(); // risk limits, fetched once per pair
 const paper = new Paper(cfg.fee);
 let sortIdx = Math.max(0, SORTS.indexOf(argv.sort as Sort));
+let rev = false; // false = biggest first
+const arrow = () => (rev ? "▲" : "▼");
 let selPair = ""; // cursor follows the pair, not the row, so re-sorting doesn't yank it away
 let sel = 0;
 let top = 0; // first visible row
@@ -82,8 +86,13 @@ async function refreshPrices() {
 
 async function scan(pairs: string[]) {
   await pool(pairs, 8, async (pair) => {
-    const [cs, b] = await Promise.all([candles1m(pair, 60), book(pair).catch(() => undefined)]);
+    const [cs, b, ins] = await Promise.all([
+      candles1m(pair, 60),
+      book(pair).catch(() => undefined),
+      instruments.get(pair) ?? instrument(pair).catch(() => undefined),
+    ]);
     if (b) books.set(pair, b);
+    if (ins) instruments.set(pair, ins);
     const t = ticks.get(pair);
     const m = t && compute(t, cs, b, cfg.fee);
     if (m) metrics.set(pair, m);
@@ -126,7 +135,9 @@ const spark = (xs: number[]) => {
   return xs.map((x) => SPARK[hi > lo ? Math.round(((x - lo) / (hi - lo)) * 7) : 3]).join("");
 };
 
-type Row = { t: Ticker; m: Metrics };
+// lev: what you'd actually get (your leverage capped at the pair's max); liqBars: typical 1m bars until liquidation
+// scorev2: ROE % kept per typical bar at the leverage you'd get (SCORE × lev), discounted by LIQ / (LIQ + 2)
+type Row = { t: Ticker; m: Metrics; lev: number; maxLev: number; liqPct: number; liqBars: number; scorev2: number };
 type Col = { h: string; w: number; left?: boolean; sort?: Sort; f: (r: Row) => [string, string?] };
 const cols: Col[] = [
   { h: "PAIR", w: 12, left: true, f: (r) => [name(r.t.pair), paper.positions.has(r.t.pair) ? C.cyn : ""] },
@@ -134,12 +145,15 @@ const cols: Col[] = [
   { h: "24H", w: 7, f: (r) => [sign(r.t.chg, 1) + "%", updown(r.t.chg)] },
   { h: "RNG24", w: 6, sort: "range", f: (r) => [range24(r.t).toFixed(0) + "%", C.dim] },
   { h: "ATR1m", w: 6, sort: "atr", f: (r) => [pct(r.m.atrPct), r.m.atrPct >= 0.5 ? C.ylw + C.b : r.m.atrPct >= 0.25 ? C.ylw : ""] },
-  { h: "ROE/c", w: 6, f: (r) => [pct(r.m.atrPct * cfg.lev, 1), C.b] },
+  { h: "ROE/c", w: 6, f: (r) => [pct(r.m.atrPct * r.lev, 1), C.b] },
+  { h: "MAXLEV", w: 6, f: (r) => [Number.isFinite(r.maxLev) ? r.maxLev + "×" : "—", r.maxLev < cfg.lev ? C.red + C.b : C.dim] },
+  { h: "LIQ", w: 5, sort: "liq", f: (r) => [Number.isFinite(r.liqBars) ? r.liqBars.toFixed(1) : "—", r.liqBars < 2 ? C.red + C.b : r.liqBars < 4 ? C.ylw : C.dim] },
   { h: "5M", w: 7, sort: "5m", f: (r) => [sign(r.m.move5m, 2) + "%", updown(r.m.move5m)] },
   { h: "VOL×", w: 5, sort: "surge", f: (r) => [r.m.volSurge.toFixed(1), r.m.volSurge >= 2 ? C.ylw : ""] },
   { h: "SPRD", w: 6, f: (r) => [pct(r.m.spreadPct, 3), r.m.spreadPct > 0.1 ? C.red : C.dim] },
   { h: "COST", w: 5, f: (r) => [(r.m.costOfAtr * 100).toFixed(0) + "%", r.m.costOfAtr > 0.5 ? C.red : r.m.costOfAtr > 0.25 ? C.ylw : C.grn] },
   { h: "SCORE", w: 6, sort: "score", f: (r) => [r.m.score.toFixed(2), C.b] },
+  { h: "SCOREv2", w: 8, sort: "scorev2", f: (r) => [r.scorev2.toFixed(1), r.liqBars < 2 ? C.red : C.grn + C.b] },
 ];
 const cell = (s: string, w: number, left?: boolean) => (left ? s.padEnd(w) : s.padStart(w)).slice(0, w);
 
@@ -149,16 +163,19 @@ const sortKey: Record<Sort, (r: Row) => number> = {
   "5m": (r) => Math.abs(r.m.move5m),
   surge: (r) => r.m.volSurge,
   range: (r) => range24(r.t),
+  liq: (r) => r.liqBars, // most room before liquidation first
+  scorev2: (r) => (r.liqBars < 2 ? r.scorev2 - 1e6 : r.scorev2), // red LIQ never sits above a safe pair
 };
 
 function rows(): Row[] {
   const out: Row[] = [];
   for (const [pair, m] of metrics) {
     const t = ticks.get(pair);
-    if (t) out.push({ t, m });
+    if (t) out.push(withLev(t, m));
   }
   const k = sortKey[SORTS[sortIdx]];
-  return out.sort((a, b) => k(b) - k(a));
+  const dir = rev ? -1 : 1;
+  return out.sort((a, b) => dir * ((k(b) || 0) - (k(a) || 0)));
 }
 
 /** Keep the cursor on `selPair` and the viewport around the cursor. */
@@ -173,7 +190,7 @@ function syncCursor(rs: Row[]) {
 
 function table(rs: Row[], from: number, limit: number, selIdx = -1): string[] {
   const sorted = SORTS[sortIdx];
-  const head = cols.map((c) => (c.sort === sorted ? paint(cell("▼" + c.h, c.w, c.left), C.b + C.cyn) : paint(cell(c.h, c.w, c.left), C.dim)));
+  const head = cols.map((c) => (c.sort === sorted ? paint(cell(arrow() + c.h, c.w, c.left), C.b + C.cyn) : paint(cell(c.h, c.w, c.left), C.dim)));
   const lines = [paint("   #  ", C.dim) + head.join(" ")];
   rs.slice(from, from + limit).forEach((r, j) => {
     const i = from + j;
@@ -189,13 +206,26 @@ function table(rs: Row[], from: number, limit: number, selIdx = -1): string[] {
   return lines;
 }
 
+function withLev(t: Ticker, m: Metrics): Row {
+  const ins = instruments.get(t.pair);
+  const maxLev = ins ? maxLeverage(ins, cfg.margin) : NaN;
+  const lev = Number.isFinite(maxLev) ? Math.min(cfg.lev, maxLev) : cfg.lev;
+  const liqPct = liqMovePct(ins, lev, cfg.margin);
+  const liqBars = liqPct / m.atrPct;
+  // LIQ / (LIQ + 2): 0.5 at the red line (2 bars), ~0.78 at 7, ~0.88 at 15
+  return { t, m, lev, maxLev, liqPct, liqBars, scorev2: m.score * lev * (liqBars / (liqBars + 2)) };
+}
+
 function detail(r: Row | undefined): string[] {
   if (!r) return ["", ""];
-  const { t, m } = r;
-  const tpRoe = cfg.lev * (cfg.tpAtr * m.atrPct - m.costPct);
-  const slRoe = -cfg.lev * (cfg.slAtr * m.atrPct + m.costPct);
+  const { t, m, lev } = r;
+  const tpRoe = lev * (cfg.tpAtr * m.atrPct - m.costPct);
+  const slRoe = -lev * (cfg.slAtr * m.atrPct + m.costPct);
+  const capped = lev < cfg.lev ? paint(`  capped at ${lev}× (max for ${name(t.pair)})`, C.red + C.b) : "";
+  const slPastLiq = cfg.slAtr * m.atrPct >= r.liqPct ? paint("  ⚠ SL is past liquidation", C.red + C.b) : "";
   return [
-    paint(name(t.pair), C.b) + "  " + spark(m.candles.slice(-40).map((k) => k.c)) + paint("  last 40m", C.dim),
+    paint(name(t.pair), C.b) + "  " + spark(m.candles.slice(-40).map((k) => k.c)) + paint("  last 40m", C.dim) +
+      `   liquidation at ${paint(`−${r.liqPct.toFixed(2)}%`, C.red)} ≈ ${r.liqBars.toFixed(1)} bars` + capped + slPastLiq,
     `  if TP hits (${cfg.tpAtr} ATR): ${paint(sign(tpRoe, 1) + "% ROE", C.grn)}   if SL hits (${cfg.slAtr} ATR): ${paint(sign(slRoe, 1) + "% ROE", C.red)}` +
       paint(`   net of ${m.costPct.toFixed(3)}% fees+spread · funding ${(t.funding * 100).toFixed(4)}%`, C.dim),
   ];
@@ -213,7 +243,7 @@ function positionsPanel(): string[] {
     out.push(
       `  ${paint(name(p.pair).padEnd(10), C.cyn)} ${paint(p.side > 0 ? "LONG " : "SHORT", p.side > 0 ? C.grn : C.red)} ${p.lev}×` +
         `  entry ${fmtPrice(p.entry)}  now ${fmtPrice(t.last)}  ${paint(`${sign(v.roe, 1)}% (${money(v.pnl)})`, updown(v.pnl) + C.b)}` +
-        paint(`  TP ${fmtPrice(p.tp)} SL ${fmtPrice(p.sl)}  ${Math.floor(age / 60)}m${String(age % 60).padStart(2, "0")}s`, C.dim),
+        paint(`  TP ${fmtPrice(p.tp)} SL ${fmtPrice(p.sl)} LIQ ${fmtPrice(p.liq)}  ${Math.floor(age / 60)}m${String(age % 60).padStart(2, "0")}s`, C.dim),
     );
   }
   return out;
@@ -230,7 +260,7 @@ function render() {
   const shown = rs.length ? `${top + 1}–${Math.min(top + page, rs.length)} of ${rs.length}` : "0";
   const title =
     paint("volhunt", C.b + C.ylw) +
-    `  sort ${paint("▼" + SORTS[sortIdx], C.b + C.cyn)}  lev ${paint(cfg.lev + "×", C.b)}  margin ${money(cfg.margin, false)}  ${paint(cur === "INR" ? `₹${rate}/USDT` : "USDT", C.cyn)}` +
+    `  sort ${paint(arrow() + SORTS[sortIdx], C.b + C.cyn)}  lev ${paint(cfg.lev + "×", C.b)}  margin ${money(cfg.margin, false)}  ${paint(cur === "INR" ? `₹${rate}/USDT` : "USDT", C.cyn)}` +
     paint(`  · CoinDCX futures · rows ${shown} · ${metrics.size}/${liquid().length} scanned · scan ${age} ago`, C.dim);
   const out = [
     title,
@@ -240,7 +270,7 @@ function render() {
     "",
     search !== null ? paint(`/${search}▏  (enter jump · esc cancel)`, C.cyn + C.b) : paint(msg, C.ylw),
     paint(
-      `j/k move · PgDn/PgUp page · g/G ends · / find · sort ${SORTS.map((s, i) => `${i + 1}:${s}`).join(" ")} · ` +
+      `j/k move · PgDn/PgUp page · g/G ends · / find · sort ${SORTS.map((s, i) => `${i + 1}:${s}`).join(" ")} · r reverse · ` +
         "i ₹/USDT · l/s long/short · c/C close · +/- lev · q quit",
       C.dim,
     ),
@@ -270,8 +300,10 @@ function trade(side: Side) {
   if (!r) return;
   if (paper.positions.has(r.t.pair)) return void (msg = `already in ${name(r.t.pair)} — c to close`);
   const atr = (r.m.atrPct / 100) * r.t.last;
-  const p = paper.open(r.t.pair, side, r.t.last, r.m.spreadPct, atr, { lev: cfg.lev, margin: cfg.margin, tpAtr: cfg.tpAtr, slAtr: cfg.slAtr });
-  msg = `opened ${side > 0 ? "LONG" : "SHORT"} ${name(p.pair)} @ ${fmtPrice(p.entry)}  TP ${fmtPrice(p.tp)} (${sign(paper.roeAt(p, p.tp, r.m.spreadPct), 1)}%)  SL ${fmtPrice(p.sl)} (${sign(paper.roeAt(p, p.sl, r.m.spreadPct), 1)}%)`;
+  const p = paper.open(r.t.pair, side, r.t.last, r.m.spreadPct, atr, {
+    lev: r.lev, margin: cfg.margin, tpAtr: cfg.tpAtr, slAtr: cfg.slAtr, liqPct: r.liqPct,
+  });
+  msg = `opened ${side > 0 ? "LONG" : "SHORT"} ${name(p.pair)} ${p.lev}× @ ${fmtPrice(p.entry)}  TP ${fmtPrice(p.tp)} (${sign(paper.roeAt(p, p.tp, r.m.spreadPct), 1)}%)  SL ${fmtPrice(p.sl)} (${sign(paper.roeAt(p, p.sl, r.m.spreadPct), 1)}%)`;
 }
 
 function closeOne(pair: string) {
@@ -329,9 +361,15 @@ function onKey(k: string) {
   else if (k === "g" || k === "\x1b[H") move(0);
   else if (k === "G" || k === "\x1b[F") move(Infinity);
   else if (k === "/") search = "";
-  else if (k === "\t" || /^[1-5]$/.test(k)) {
-    sortIdx = k === "\t" ? (sortIdx + 1) % SORTS.length : +k - 1;
+  else if (k === "\t" || k === "\x1b[Z" || /^[1-7]$/.test(k)) {
+    // tab = next sort, shift+tab = previous, digits jump straight to one
+    const n = SORTS.length;
+    sortIdx = k === "\t" ? (sortIdx + 1) % n : k === "\x1b[Z" ? (sortIdx - 1 + n) % n : +k - 1;
     msg = `sort: ${SORTS[sortIdx]}`;
+    move(0);
+  } else if (k === "r") {
+    rev = !rev;
+    msg = `sort: ${SORTS[sortIdx]} ${rev ? "(smallest first)" : "(biggest first)"}`;
     move(0);
   }
   else if (k === "i" && rate) (cur = cur === "INR" ? "USDT" : "INR"), (msg = `showing ${cur}`);
