@@ -6,7 +6,7 @@ import { compute, liqMovePct, maxLeverage, type Metrics } from "./metrics";
 import { Paper, type Side } from "./paper";
 
 // Same left-to-right order as the table columns, so tab / shift+tab step to the neighbouring column.
-const SORTS = ["range", "atr", "liq", "5m", "surge", "score", "scorev2"] as const;
+const SORTS = ["range", "atr", "liq", "5m", "surge", "score", "scorev2", "scorev3"] as const;
 type Sort = (typeof SORTS)[number];
 
 const { values: argv } = parseArgs({
@@ -21,6 +21,7 @@ const { values: argv } = parseArgs({
     "min-vol": { type: "string", default: "1000000" }, // min 24h volume, USDT
     top: { type: "string", default: "30" }, // hottest pairs re-scanned every cycle
     once: { type: "boolean", default: false }, // print one ranked table and exit
+    all: { type: "boolean", default: false }, // start with every column shown (toggle with H)
     help: { type: "boolean", short: "h", default: false },
   },
 });
@@ -30,11 +31,12 @@ if (argv.help) {
 
 usage: bun src/main.ts [--sort ${SORTS.join("|")}] [--lev 15] [--currency inr|usdt] [--margin 2000]
                        [--tp 1.5] [--sl 1] [--fee 0.059]
-                       [--min-vol 1000000] [--top 30] [--once]
+                       [--min-vol 1000000] [--top 30] [--once] [--all]
 
   --tp/--sl   distances in 1-minute ATRs, so targets scale with how much each pair moves
   --margin    paper margin per trade, in --currency
-  --once      print a single ranked table (pipe-friendly) and exit`);
+  --once      print a single ranked table (pipe-friendly) and exit
+  --all       show every column, not just PAIR MAXLEV LIQ SCORE SCOREv2 SCOREv3 (H toggles)`);
   process.exit(0);
 }
 
@@ -137,7 +139,8 @@ const spark = (xs: number[]) => {
 
 // lev: what you'd actually get (your leverage capped at the pair's max); liqBars: typical 1m bars until liquidation
 // scorev2: ROE % kept per typical bar at the leverage you'd get (SCORE × lev), discounted by LIQ / (LIQ + 2)
-type Row = { t: Ticker; m: Metrics; lev: number; maxLev: number; liqPct: number; liqBars: number; scorev2: number };
+// scorev3: MAXLEV ÷ LIQ, high when the pair allows big leverage and moves fast relative to its liquidation distance
+type Row = { t: Ticker; m: Metrics; lev: number; maxLev: number; liqPct: number; liqBars: number; scorev2: number; scorev3: number };
 type Col = { h: string; w: number; left?: boolean; sort?: Sort; f: (r: Row) => [string, string?] };
 const cols: Col[] = [
   { h: "PAIR", w: 12, left: true, f: (r) => [name(r.t.pair), paper.positions.has(r.t.pair) ? C.cyn : ""] },
@@ -154,7 +157,13 @@ const cols: Col[] = [
   { h: "COST", w: 5, f: (r) => [(r.m.costOfAtr * 100).toFixed(0) + "%", r.m.costOfAtr > 0.5 ? C.red : r.m.costOfAtr > 0.25 ? C.ylw : C.grn] },
   { h: "SCORE", w: 6, sort: "score", f: (r) => [r.m.score.toFixed(2), C.b] },
   { h: "SCOREv2", w: 8, sort: "scorev2", f: (r) => [r.scorev2.toFixed(1), r.liqBars < 2 ? C.red : C.grn + C.b] },
+  { h: "SCOREv3", w: 8, sort: "scorev3", f: (r) => [Number.isFinite(r.scorev3) ? r.scorev3.toFixed(1) : "—", r.liqBars < 2 ? C.red : C.cyn + C.b] },
 ];
+// The compact view (default) shows only these; H toggles every column.
+const COMPACT = new Set(["PAIR", "MAXLEV", "LIQ", "SCORE", "SCOREv2", "SCOREv3"]);
+let allCols = argv.all;
+const shownCols = () => (allCols ? cols : cols.filter((c) => COMPACT.has(c.h)));
+const shownSorts = () => SORTS.filter((s) => shownCols().some((c) => c.sort === s));
 const cell = (s: string, w: number, left?: boolean) => (left ? s.padEnd(w) : s.padStart(w)).slice(0, w);
 
 const sortKey: Record<Sort, (r: Row) => number> = {
@@ -165,6 +174,7 @@ const sortKey: Record<Sort, (r: Row) => number> = {
   range: (r) => range24(r.t),
   liq: (r) => r.liqBars, // most room before liquidation first
   scorev2: (r) => (r.liqBars < 2 ? r.scorev2 - 1e6 : r.scorev2), // red LIQ never sits above a safe pair
+  scorev3: (r) => r.scorev3,
 };
 
 function rows(): Row[] {
@@ -190,11 +200,12 @@ function syncCursor(rs: Row[]) {
 
 function table(rs: Row[], from: number, limit: number, selIdx = -1): string[] {
   const sorted = SORTS[sortIdx];
-  const head = cols.map((c) => (c.sort === sorted ? paint(cell(arrow() + c.h, c.w, c.left), C.b + C.cyn) : paint(cell(c.h, c.w, c.left), C.dim)));
+  const cs = shownCols();
+  const head = cs.map((c) => (c.sort === sorted ? paint(cell(arrow() + c.h, c.w, c.left), C.b + C.cyn) : paint(cell(c.h, c.w, c.left), C.dim)));
   const lines = [paint("   #  ", C.dim) + head.join(" ")];
   rs.slice(from, from + limit).forEach((r, j) => {
     const i = from + j;
-    const body = cols.map((c) => {
+    const body = cs.map((c) => {
       const [s, col] = c.f(r);
       const hot = c.sort === sorted ? C.b : ""; // sorted column's values in bold
       // no styling inside the selected row: a reset there would cancel its inverse highlight
@@ -213,7 +224,8 @@ function withLev(t: Ticker, m: Metrics): Row {
   const liqPct = liqMovePct(ins, lev, cfg.margin);
   const liqBars = liqPct / m.atrPct;
   // LIQ / (LIQ + 2): 0.5 at the red line (2 bars), ~0.78 at 7, ~0.88 at 15
-  return { t, m, lev, maxLev, liqPct, liqBars, scorev2: m.score * lev * (liqBars / (liqBars + 2)) };
+  const scorev3 = liqBars > 0 ? maxLev / liqBars : NaN;
+  return { t, m, lev, maxLev, liqPct, liqBars, scorev2: m.score * lev * (liqBars / (liqBars + 2)), scorev3 };
 }
 
 function detail(r: Row | undefined): string[] {
@@ -271,7 +283,7 @@ function render() {
     search !== null ? paint(`/${search}▏  (enter jump · esc cancel)`, C.cyn + C.b) : paint(msg, C.ylw),
     paint(
       `j/k move · PgDn/PgUp page · g/G ends · / find · sort ${SORTS.map((s, i) => `${i + 1}:${s}`).join(" ")} · r reverse · ` +
-        "i ₹/USDT · l/s long/short · c/C close · +/- lev · q quit",
+        "H all columns · i ₹/USDT · l/s long/short · c/C close · +/- lev · q quit",
       C.dim,
     ),
   ];
@@ -361,10 +373,15 @@ function onKey(k: string) {
   else if (k === "g" || k === "\x1b[H") move(0);
   else if (k === "G" || k === "\x1b[F") move(Infinity);
   else if (k === "/") search = "";
-  else if (k === "\t" || k === "\x1b[Z" || /^[1-7]$/.test(k)) {
-    // tab = next sort, shift+tab = previous, digits jump straight to one
-    const n = SORTS.length;
-    sortIdx = k === "\t" ? (sortIdx + 1) % n : k === "\x1b[Z" ? (sortIdx - 1 + n) % n : +k - 1;
+  else if (k === "\t" || k === "\x1b[Z" || /^[1-8]$/.test(k)) {
+    // tab = next visible sort column, shift+tab = previous, digits jump straight to any sort
+    if (/^[1-8]$/.test(k)) sortIdx = +k - 1;
+    else {
+      const vis = shownSorts(), n = vis.length;
+      const i = vis.indexOf(SORTS[sortIdx]);
+      const next = i < 0 ? (k === "\t" ? 0 : n - 1) : k === "\t" ? (i + 1) % n : (i - 1 + n) % n;
+      sortIdx = SORTS.indexOf(vis[next]);
+    }
     msg = `sort: ${SORTS[sortIdx]}`;
     move(0);
   } else if (k === "r") {
@@ -372,6 +389,7 @@ function onKey(k: string) {
     msg = `sort: ${SORTS[sortIdx]} ${rev ? "(smallest first)" : "(biggest first)"}`;
     move(0);
   }
+  else if (k === "H") (allCols = !allCols), (msg = allCols ? "showing every column (H for the compact view)" : "compact view: PAIR MAXLEV LIQ SCORE SCOREv2 SCOREv3 (H for every column)");
   else if (k === "i" && rate) (cur = cur === "INR" ? "USDT" : "INR"), (msg = `showing ${cur}`);
   else if (k === "+" || k === "=") cfg.lev = Math.min(cfg.lev + 1, 100);
   else if (k === "-") cfg.lev = Math.max(cfg.lev - 1, 1);

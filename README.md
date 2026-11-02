@@ -7,9 +7,12 @@ bun src/main.ts                       # TUI, ₹, sorted by SCORE
 bun src/main.ts --currency usdt       # start in USDT
 bun src/main.ts --margin 2000 --lev 15 --tp 1.5 --sl 1
 bun src/main.ts --once                # print one ranked table and exit
+bun src/main.ts --all                 # start with every column shown
 ```
 
 ## Columns
+
+By default only PAIR, MAXLEV, LIQ, SCORE, SCOREv2 and SCOREv3 are shown. Press `H` (shift+h) to toggle every column; `--all` starts with them all (also for `--once`).
 
 | col   | meaning |
 |-------|---------|
@@ -24,6 +27,7 @@ bun src/main.ts --once                # print one ranked table and exit
 | COST  | round-trip cost (2 × 0.059% taker fee + spread) as a share of one bar. Above 50% means fees eat most of the move |
 | SCORE | ATR1m × √(VOL×) × (1 − COST) |
 | SCOREv2 | SCORE × the leverage you'd actually get × LIQ / (LIQ + 2). It reads as the % ROE you keep per typical bar, discounted for how close liquidation is: halved at LIQ 2, ×0.78 at LIQ 7, ×0.88 at LIQ 15. Pairs with LIQ under 2 are shown in red and always sort below the rest |
+| SCOREv3 | MAXLEV ÷ LIQ. High when the pair allows a lot of leverage *and* moves fast compared with its distance to liquidation, so it ranks the most aggressive pairs first. Red when LIQ is under 2 (it does not push those down) |
 | RNG24 | 24h high−low range as % of price |
 
 ## Keys
@@ -34,7 +38,8 @@ bun src/main.ts --once                # print one ranked table and exit
 | `PgDn/PgUp` `space` `^d/^u` | page |
 | `g/G` | top / bottom |
 | `/` | find a pair by name; it gets scanned if it hasn't been yet |
-| `1`–`7`, `tab` / `shift+tab` | sort by column, left to right: range, atr, liq (most room before liquidation first), 5m, surge, score, scorev2. Tab moves one column right, shift+tab one left |
+| `1`–`8`, `tab` / `shift+tab` | sort by column: range, atr, liq (most room before liquidation first), 5m, surge, score, scorev2, scorev3. Tab moves to the next sortable column you can see, shift+tab to the previous one (in the compact view: liq, score, scorev2, scorev3). Digits pick any sort, even a hidden column's |
+| `H` | toggle between the compact view and every column |
 | `r` | reverse the sort (▼ biggest first, ▲ smallest first) |
 | `i` | toggle ₹ / USDT |
 | `l` / `s` | paper long / short |
